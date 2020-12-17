@@ -405,7 +405,7 @@ class WebsocketConnection:
             tagdict = {}
             for tag in str(tags).split(";"):
                 t = tag.split("=")
-                if t[1].isdecimal(): # t[1].isnumeric():
+                if t[1].isdecimal():
                     t[1] = int(t[1])
                 tagdict[t[0]] = t[1]
             tags = tagdict
@@ -557,13 +557,16 @@ class WebsocketConnection:
 
             self._channel_cache[channel] = {'channel': chan_, 'bot': user}
 
-            if self._pending_joins:
+            if channel in self._pending_joins:
                 self._pending_joins[channel].set_result(None)
                 self._pending_joins.pop(channel)
 
             self._channel_token += 1
 
-        cache = self._channel_cache[channel]['channel']._users
+        try:
+            cache = self._channel_cache[channel]['channel']._users
+        except KeyError as e:
+            raise ClientError("The \"nick\" value passed to the constructor does not match the user we are logged in as") from e
 
         try:
             user = cache[author.lower()]

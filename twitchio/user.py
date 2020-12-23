@@ -22,150 +22,83 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
-from .abcs import Messageable
+import time
+from typing import TYPE_CHECKING, List, Optional
+
+from .enums import BroadcasterTypeEnum, UserTypeEnum
+from .errors import HTTPException, Unauthorized
+from .rewards import CustomReward
+from .channel import Channel
 
 
-class PartialUser(Messageable):
+if TYPE_CHECKING:
+    from .http import TwitchHTTP
 
-    __messageable_channel__ = False
+__all__ = (
+    "User",
+)
 
-    def __init__(self, websocket, **kwargs):
-        self._name = kwargs.get('name')
-        self._ws = websocket
-        self._bot = kwargs.get('bot')
-        self._channel = kwargs.get('channel', self._name)
-
-    def __str__(self):
-        return self._name
-
-    def __repr__(self):
-        return f'<PartialUser name: {self._name}, channel: {self._channel}>'
-
-    def __eq__(self, other):
-        return other.name == self.name and other.channel.name == other.channel.name
-
-    def __hash__(self):
-        return hash(self.name + self.channel.name)
-
-    @property
-    def name(self):
-        """The users name"""
-        return self._name
-
-    @property
-    def channel(self):
-        """The channel associated with the user."""
-        return self._channel
-
-    def _fetch_channel(self):
-        return self._name  # Abstract method
-
-    def _fetch_websocket(self):
-        return self._ws  # Abstract method
-
-    def _bot_is_mod(self):
-        return False
-
-
-class User(Messageable):
-    __slots__ = ('_name', '_channel', '_tags', '_ws', '_bot', 'id', '_turbo', '_sub', '_mod',
-                 '_display_name', '_colour')
-
-    __messageable_channel__ = False
-
-    def __init__(self, websocket, **kwargs):
-        self._name = kwargs.get('name')
-        self._channel = kwargs.get('channel', self._name)
-        self._tags = kwargs.get('tags', None)
-        self._ws = websocket
-        self._bot = kwargs.get('bot')
-
-        if not self._tags:
-            return
-
-        self.id = self._tags.get('user-id')
-        self._turbo = self._tags.get('turbo')
-        self._sub = self._tags['subscriber']
-        self._mod = int(self._tags['mod'])
-        self._display_name = self._tags['display-name']
-        self._colour = self._tags['color']
-
-    def __str__(self):
-        return self._name or self.display_name.lower()
-
-    def __repr__(self):
-        return f'<User name: {self._name}, channel: {self._channel}>'
-
-    def __eq__(self, other):
-        return other.name == self.name and other.channel.name == other.channel.name
-
-    def __hash__(self):
-        return hash(self.name + self.channel.name)
-
-    def _fetch_channel(self):
-        return self  # Abstract method
-
-    def _fetch_websocket(self):
-        return self._ws  # Abstract method
-
-    def _bot_is_mod(self):
-        cache = self._ws._cache[self._channel.name]
-        for user in cache:
-            if user.name == self._bot.nick:
-                try:
-                    mod = user.is_mod
-                except AttributeError:
-                    return False
-
-                return mod
+class User:
+    __slots__ = ("_http", "id", "name", "display_name", "type", "broadcaster_type", "description", "profile_image", "offline_image", "view_count", "email", "_cached_rewards")
+    def __init__(self, http: "TwitchHTTP", data: dict):
+        self._http = http
+        self.id = int(data['id'])
+        self.name = data['login']
+        self.display_name = data['display_name']
+        self.type = UserTypeEnum(data['type'])
+        self.broadcaster_type = BroadcasterTypeEnum(data['broadcaster_type'])
+        self.description = data['description']
+        self.profile_image = data['profile_image_url']
+        self.offline_image = data['offline_image_url']
+        self.view_count = data['view_count'],
+        self.email = data.get("email", None)
+        self._cached_rewards = None
 
     @property
-    def channel(self):
-        """The channel the user is associated with."""
-        return self._channel
+    def channel(self) -> Optional[Channel]:
+        """
+        Returns the :class:`twitchio.Channel` associated with this user. Could be None if you are not part of the channel's chat
 
-    @property
-    def name(self):
-        """The users name. This may be formatted differently than display name."""
-        return self._name or self.display_name.lower()
+        Returns
+        --------
+        Optional[:class:`twitchio.Channel`]
+        """
+        if self.name in self._http.client._connection._cache:
+            return Channel(self.name, self._http.client._connection)
 
-    @property
-    def display_name(self):
-        """The users display name."""
-        return self._display_name
+    async def get_custom_rewards(self, token: str, *, only_manageable=False, ids: List[int]=None, force=False) -> List["CustomReward"]:
+        """
+        Fetches the channels custom rewards (aka channel points) from the api.
+        Parameters
+        ----------
+        token : :class:`str`
+            The users oauth token.
+        only_manageable : :class:`bool`
+            Whether to fetch all rewards or only ones you can manage. Defaults to false.
+        ids : List[:class:`int`]
+            An optional list of reward ids
+        force : :class:`bool`
+            Whether to force a fetch or try to get from cache. Defaults to False
 
-    @property
-    def colour(self):
-        """The users colour. Alias to color."""
-        return self._colour
+        Returns
+        -------
 
-    @property
-    def color(self):
-        """The users color."""
-        return self.colour
+        """
+        if not force and self._cached_rewards:
+            if self._cached_rewards[0]+300 > time.monotonic():
+                return self._cached_rewards[1]
 
-    @property
-    def is_mod(self) -> bool:
-        """A boolean indicating whether the User is a moderator of the current channel."""
-        if self._mod == 1:
-            return True
-        if self.channel.name == self.display_name.lower():
-            return True
+        try:
+            data = await self._http.get_rewards(token, self.id, only_manageable, ids)
+        except Unauthorized as error:
+            raise Unauthorized("The given token is invalid", "", 401) from error
+        except HTTPException as error:
+            status = error.args[2]
+            if status == 403:
+                raise HTTPException("The custom reward was created by a different application, or channel points are "
+                                    "not available for the broadcaster (403)", error.args[1], 403) from error
+            raise
         else:
-            return False
-
-    @property
-    def is_turbo(self) -> bool:
-        """A boolean indicating whether the User is Turbo.
-
-        Could be None if no Tags were received.
-        """
-        return self._turbo
-
-    @property
-    def is_subscriber(self) -> bool:
-        """A boolean indicating whether the User is a subscriber of the current channel.
-
-        Could be None if no Tags were received.
-        """
-        return self._sub
+            values = [CustomReward(self._http, x, self) for x in data]
+            self._cached_rewards = time.monotonic(), values
+            return values

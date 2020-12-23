@@ -22,16 +22,13 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
-import asyncio
 import importlib
 import inspect
 import itertools
 import sys
 import traceback
-from typing import Callable, Optional, Union
-from twitchio.channel import Channel
+from typing import Callable, Optional, Union, Coroutine
 from twitchio.client import Client
-from twitchio.websocket import WSConnection
 from .core import *
 from .errors import *
 from .meta import Cog
@@ -41,16 +38,20 @@ from .utils import _CaseInsensitiveDict
 
 class Bot(Client):
 
-    def __init__(self, irc_token: str, *, nick: str, prefix: Union[str, list, tuple],
-                 initial_channels: Union[list, tuple, Callable] = None, **kwargs):
-        super().__init__(client_id=kwargs.get('client_id'))
-
-        self.loop = kwargs.get('loop', asyncio.get_event_loop())
-        self._connection = WSConnection(bot=self, token=irc_token, nick=nick.lower(), loop=self.loop,
-                                        initial_channels=initial_channels)
+    def __init__(self,
+                 irc_token: str,
+                 *,
+                 nick: str,
+                 prefix: Union[str, list, tuple, set, Callable, Coroutine],
+                 api_token: str = None,
+                 client_id: str = None,
+                 client_secret: str = None,
+                 initial_channels: Union[list, tuple, Callable] = None,
+                 **kwargs
+                 ):
+        super().__init__(irc_token, nick=nick, api_token=api_token, client_id=client_id, client_secret=client_secret, initial_channels=initial_channels)
 
         self._prefix = prefix
-        self._nick = nick.lower()
 
         if kwargs.get('case_insensitive', False):
             self._commands = _CaseInsensitiveDict()
@@ -61,7 +62,6 @@ class Bot(Client):
 
         self._modules = {}
         self._cogs = {}
-        self._events = {}
         self._checks = []
 
         self.__init__commands__()
@@ -141,7 +141,7 @@ class Bot(Client):
 
         Parameters
         ------------
-        name: str
+        name: :class:`str`
             The name or alias of the command to retrieve.
 
         Returns
@@ -152,6 +152,34 @@ class Bot(Client):
 
         return self._commands.get(name, None)
 
+    def remove_command(self, name: str):
+        """
+        Method which removes a registered command
+
+        Parameters
+        -----------
+        name: :class:`str`
+            the name or alias of the command to delete.
+
+        Returns
+        --------
+        None
+
+        Raises
+        -------
+        :class:`.CommandNotFound` The command was not found
+        """
+        name = self._command_aliases.pop(name, name)
+
+        for alias in list(self._command_aliases.keys()):
+            if self._command_aliases[alias] == name:
+                del self._command_aliases[alias]
+
+        try:
+            del self._commands[name]
+        except KeyError:
+            raise CommandNotFound(f"The command '{name}` was not found")
+
     async def get_context(self, message, *, cls=None):
         # TODO Docs
         if not cls:
@@ -161,7 +189,7 @@ class Bot(Client):
         if not prefix:
             return cls(message=message, prefix=prefix, valid=False)
 
-        content = message.content[len(prefix)::].lstrip(' ')  # Strip prefix and remainder whitespace
+        content = message.content[len(prefix)::].lstrip()  # Strip prefix and remainder whitespace
         parsed = StringParser().process_string(content)  # Return the string as a dict view
 
         try:
@@ -181,7 +209,7 @@ class Bot(Client):
 
         args, kwargs = command_.parse_args(command_._instance, parsed)
 
-        context = cls(message=message, prefix=prefix, command=command_, args=args, kwargs=kwargs,
+        context = cls(message=message, bot=self, prefix=prefix, command=command_, args=args, kwargs=kwargs,
                       valid=True)
         return context
 
@@ -195,42 +223,52 @@ class Bot(Client):
         if not context.prefix:
             return
 
+        async def try_run(func, *, to_command=False):
+            try:
+                await func
+            except Exception as _e:
+                if not to_command:
+                    self.run_event("error", _e)
+                else:
+                    self.run_event("command_error", context, _e)
+
         check_result = await self.handle_checks(context)
 
         if check_result is not True:
-            return await self.event_command_error(context, check_result)
+            self.run_event("command_error", context, check_result)
+            return
 
         limited = self._run_cooldowns(context)
 
         if limited:
-            return await self.event_command_error(context, limited[0])
+            self.run_event("command_error", context, limited[0])
+            return
 
         instance = context.command._instance
+        if instance:
+            args = [instance, context]
+        else:
+            args = [context]
+
+        await try_run(self.global_before_invoke(context))
+
+        if context.command._before_invoke:
+            await try_run(context.command._before_invoke(*args), to_command=True)
 
         try:
-            await self.global_before_invoke(context)
-
-            if context.command._before_invoke:
-                await context.command._before_invoke(instance, context)
-
-            if instance:
-                await context.command._callback(instance, context, *context.args, **context.kwargs)
-            else:
-                await context.command._callback(context, *context.args, **context.kwargs)
+            await context.command._callback(*args, *context.args, **context.kwargs)
 
         except Exception as e:
             if context.command.event_error:
-                await context.command.on_error(instance, context, e)
+                await try_run(context.command.event_error(*args, e))
 
-            await self.event_command_error(context, e)
+            self.run_event("command_error", context, e)
 
-        try:
-            # Invoke our after command hooks...
-            if context.command._after_invoke:
-                await context.command._after_invoke(context)
-            await self.global_after_invoke(context)
-        except Exception as e:
-            await self.event_command_error(context, e)
+        # Invoke our after command hooks...
+        if context.command._after_invoke:
+            await try_run(context.command._after_invoke(*args), to_command=True)
+
+        await try_run(self.global_after_invoke(context))
 
     def _run_cooldowns(self, context):
         try:
@@ -283,7 +321,7 @@ class Bot(Client):
             The name of the module to load in dot.path format.
         """
         if name in self._modules:
-            return
+            raise ValueError(f"Module <{name}> is already loaded")
 
         module = importlib.import_module(name)
 
@@ -294,8 +332,47 @@ class Bot(Client):
             del sys.modules[name]
             raise ImportError(f'Module <{name}> is missing a prepare method')
 
+        self._modules[name] = module
+
+    def unload_module(self, name: str):
         if name not in self._modules:
-            self._modules[name] = module
+            raise ValueError(f"Module <{name}> is not loaded")
+
+        module = self._modules.pop(name)
+
+        if hasattr(module, "breakdown"):
+            try:
+                module.breakdown(self)
+            except:
+                pass
+
+        to_delete = [cog_name for cog_name, cog in self._cogs.items() if cog.__module__ == module]
+        for name in to_delete:
+            self.remove_cog(name)
+
+        to_delete = [name for name, cmd in self._commands if cmd._callback.__module__ == module]
+        for name in to_delete:
+            self.remove_command(name)
+
+        for m in list(sys.modules.keys()):
+            if m == module.__name__ or m.startswith(module.__name__ + "."):
+                del sys.modules[m]
+
+    def reload_module(self, name: str):
+        if name not in self._modules:
+            raise ValueError(f"Module <{name}> is not loaded")
+
+        module = self._modules.pop(name)
+
+        modules = {name: m for name, m in sys.modules.items() if name == module.__name__ or name.startswith(module.__name__ + ".")}
+
+        try:
+            self.unload_module(name)
+            self.load_module(name)
+        except Exception as e:
+            sys.modules.update(modules)
+            module.prepare(self)
+            raise
 
     def add_cog(self, cog):
         if not isinstance(cog, Cog):
@@ -306,6 +383,14 @@ class Bot(Client):
 
         cog._load_methods(self)
         self._cogs[cog.name] = cog
+
+    def remove_cog(self, cog_name: str):
+        if cog_name not in self._cogs:
+            raise InvalidCog(f"Cog '{cog_name}' not found")
+
+        cog = self._cogs.pop(cog_name)
+
+        cog._unload_methods(self)
 
     async def global_before_invoke(self, ctx):
         """|coro|
@@ -357,50 +442,13 @@ class Bot(Client):
         """
         pass
 
-    def add_event(self):
-        pass
-
-    @property
-    def nick(self):
-        return self._nick
-
     @property
     def commands(self):
         return self._commands
 
     @property
-    def events(self):
-        return self._events
-
-    @property
     def cogs(self):
         return self._cogs
-
-    def get_channel(self, name: str):
-        """Retrieve a channel from the cache.
-
-        Parameters
-        -----------
-        name: str
-            The channel name to retrieve from cache. Returns None if no channel was found.
-
-        Returns
-        --------
-            :class:`.Channel`
-        """
-        name = name.lower()
-
-        try:
-            self._connection._cache[name]  # this is a bit silly, but for now it'll do...
-        except KeyError:
-            return None
-
-        # Basically the cache doesn't store channels naturally, instead it stores a channel key
-        # With the associated users as a set.
-        # We create a Channel here and return it only if the cache has that channel key.
-
-        channel = Channel(name=name, websocket=self._connection, bot=self)
-        return channel
 
     async def event_command_error(self, context, error):
         """|coro|
@@ -417,100 +465,6 @@ class Bot(Client):
         print(f'Ignoring exception in command: {error}:', file=sys.stderr)
         traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
 
-    async def event_mode(self, channel, user, status):
-        """|coro|
-
-        Event called when a MODE is received from Twitch.
-
-        Parameters
-        ------------
-        channel: :class:`.Channel`
-            Channel object relevant to the MODE event.
-        user: :class:`.User`
-            User object containing relevant information to the MODE.
-        status: str
-            The JTV status received by Twitch. Could be either o+ or o-.
-            Indicates a moderation promotion/demotion to the :class:`.User`
-        """
-        pass
-
-    async def event_userstate(self, user):
-        """|coro|
-
-        Event called when a USERSTATE is received from Twitch.
-
-        Parameters
-        ------------
-        user: :class:`.User`
-            User object containing relevant information to the USERSTATE.
-        """
-        pass
-
-    async def event_raw_usernotice(self, channel, tags: dict):
-        """|coro|
-
-        Event called when a USERNOTICE is received from Twitch.
-        Since USERNOTICE's can be fairly complex and vary, the following sub-events are available:
-
-            :meth:`event_usernotice_subscription` :
-            Called when a USERNOTICE Subscription or Re-subscription event is received.
-
-
-        .. seealso::
-
-            For more information on how to handle USERNOTICE's visit:
-            https://dev.twitch.tv/docs/irc/tags/#usernotice-twitch-tags
-
-
-        Parameters
-        ------------
-        channel: :class:`.Channel`
-            Channel object relevant to the USERNOTICE event.
-        tags : dict
-            A dictionary with the relevant information associated with the USERNOTICE.
-            This could vary depending on the event.
-        """
-        pass
-
-    async def event_usernotice_subscription(self, metadata):
-        """|coro|
-
-        Event called when a USERNOTICE subscription or re-subscription event is received from Twitch.
-
-        Parameters
-        ------------
-        metadata: :class:`twitchio.dataclasses.NoticeSubscription`
-            The object containing various metadata about the subscription event.
-            For ease of use, this contains a :class:`.User` and :class:`.Channel`.
-        """
-        pass
-
-    async def event_part(self, user):
-        """|coro|
-
-        Event called when a PART is received from Twitch.
-
-        Parameters
-        ------------
-        user: :class:`.User`
-            User object containing relevant information to the PART.
-        """
-        pass
-
-    async def event_join(self, channel, user):
-        """|coro|
-
-        Event called when a JOIN is received from Twitch.
-
-        Parameters
-        ------------
-        channel: :class:`.Channel`
-            The channel associated with the JOIN.
-        user: :class:`.User`
-            User object containing relevant information to the JOIN.
-        """
-        pass
-
     async def event_message(self, message):
         """|coro|
 
@@ -522,63 +476,6 @@ class Bot(Client):
             Message object containing relevant information.
         """
         await self.handle_commands(message)
-
-    async def event_error(self, error: Exception, data=None):
-        """|coro|
-
-        Event called when an error occurs while processing data.
-
-        Parameters
-        ------------
-        error: Exception
-            The exception raised.
-        data: str
-            The raw data received from Twitch. Depending on how this is called, this could be None.
-
-        Example
-        ---------
-        .. code:: py
-
-            @bot.event
-            async def event_error(error, data):
-                traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
-        """
-        traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
-
-    async def event_ready(self):
-        """|coro|
-
-        Event called when the Bot has logged in and is ready.
-
-        Example
-        ---------
-        .. code:: py
-
-            @bot.event
-            async def event_ready():
-                print(f'Logged into Twitch | {bot.nick}')
-        """
-        pass
-
-    async def event_raw_data(self, data):
-        """|coro|
-
-        Event called with the raw data received by Twitch.
-
-        Parameters
-        ------------
-        data: str
-            The raw data received from Twitch.
-
-        Example
-        ---------
-        .. code:: py
-
-            @bot.event
-            async def event_raw_data(data):
-                print(data)
-        """
-        pass
 
     def command(self, *, name: str=None, aliases: Union[list, tuple]=None, cls=Command, no_global_checks=False):
         """Decorator which registers a command with the bot.
@@ -613,16 +510,3 @@ class Bot(Client):
 
             return cmd
         return decorator
-
-    def run(self):
-        try:
-            self.loop.create_task(self._connection._connect())
-            self.loop.run_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.loop.create_task(self.close())
-
-    async def close(self):
-        # TODO session close
-        self._connection._close()
